@@ -1,0 +1,131 @@
+--- a/vllm/model_executor/models/gemma4_dspark.py
++++ b/vllm/model_executor/models/gemma4_dspark.py
+@@ -177,12 +177,15 @@
+         draft_vocab_size = (
+             getattr(config, "draft_vocab_size", None) or config.vocab_size
+         )
+-        self.markov_head = DSparkMarkovHead(
+-            config.vocab_size,
+-            draft_vocab_size,
+-            config.markov_rank,
+-            prefix=maybe_prefix(prefix, "markov_head"),
+-        )
++        # markov_rank 0 (DeepSpec DFlash checkpoints): no Markov head
++        self.markov_head: DSparkMarkovHead | None = None
++        if int(getattr(config, "markov_rank", 0)) > 0:
++            self.markov_head = DSparkMarkovHead(
++                config.vocab_size,
++                draft_vocab_size,
++                config.markov_rank,
++                prefix=maybe_prefix(prefix, "markov_head"),
++            )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids) * self.normalizer
+@@ -296,6 +299,10 @@
+                 continue
+             if "lm_head" not in name:
+                 name = "model." + name
++            if "embed_tokens" in name:
++                self.has_own_embed_tokens = True
++            if "lm_head" in name:
++                self.has_own_lm_head = True
+             for pn, wn, shard in stacked:
+                 if wn in name and (mapped := name.replace(wn, pn)) in params:
+                     params[mapped].weight_loader(params[mapped], w, shard)
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -76,8 +76,12 @@
+         markov_embed: torch.Tensor,
+         logits_processor: LogitsProcessor,
+     ) -> torch.Tensor:
+-        """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
+-        return logits_processor(self.markov_w2, markov_embed)
++        """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V]).
++
++        The bias is a plain projection, so the soft cap and scale of the logits
++        processor are not applied to it.
++        """
++        return logits_processor._get_logits(markov_embed, self.markov_w2, None)
+ 
+     def apply_bias_gathered(
+         self,
+@@ -149,13 +153,16 @@
+         draft_vocab_size = (
+             getattr(config, "draft_vocab_size", None) or config.vocab_size
+         )
+-        self.markov_head = DSparkMarkovHead(
+-            config.vocab_size,
+-            draft_vocab_size,
+-            config.markov_rank,
+-            prefix=maybe_prefix(prefix, "markov_head"),
+-            quant_config=self.quant_config,
+-        )
++        # markov_rank 0 (DeepSpec DFlash checkpoints): no Markov head
++        self.markov_head: DSparkMarkovHead | None = None
++        if int(getattr(config, "markov_rank", 0)) > 0:
++            self.markov_head = DSparkMarkovHead(
++                config.vocab_size,
++                draft_vocab_size,
++                config.markov_rank,
++                prefix=maybe_prefix(prefix, "markov_head"),
++                quant_config=self.quant_config,
++            )
+         self.confidence_head: DSparkConfidenceHead | None = None
+         if getattr(config, "enable_confidence_head", False):
+             with_markov = getattr(config, "confidence_head_with_markov", False)
+@@ -236,7 +243,7 @@
+             logits,
+             values,
+             index,
+-            self.logits_processor.scale,
++            1.0,
+         )
+ 
+     def compute_confidence(
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -108,6 +108,11 @@
+                 dtype=self.draft_logits.dtype,
+                 device=self.device,
+             )
++        if model.model.markov_head is None and self._draft_topk is not None:
++            raise ValueError(
++                "dspark_draft_topk requires a Markov head; this checkpoint has "
++                "markov_rank == 0."
++            )
+         if self.enable_adaptive_verification and model.model.confidence_head is None:
+             raise ValueError(
+                 "Adaptive verification needs a DSpark checkpoint with a confidence "
+@@ -149,7 +154,31 @@
+             use_fp64=self.use_fp64_gumbel,
+         )
+ 
++    def _sample_parallel_no_markov(
++        self, num_reqs: int, head_hidden: torch.Tensor
++    ) -> None:
++        """Without a Markov head every block position is sampled from its own logits."""
++        n_spec = self.num_speculative_steps
++        num_sample = num_reqs * n_spec
++        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        base_logits = self.model.compute_draft_logits(sample_hidden)
++        if self.draft_logits is None:
++            tokens = self.model.map_draft_to_target(base_logits.argmax(dim=-1))
++            self.draft_tokens[:num_reqs, :n_spec].copy_(tokens.view(num_reqs, n_spec))
++            return
++        vocab_size = base_logits.shape[-1]
++        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
++        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
++        for i in range(n_spec):
++            self.draft_tokens[:num_reqs, i] = self._sample_logits(
++                base_logits[:, i], idx_map[:, i], sample_pos[:, i], i
++            )
++
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++        if self.model.model.markov_head is None:
++            self._sample_parallel_no_markov(num_reqs, head_hidden)
++            return
+         if self._draft_topk is not None:
+             self._sample_sequential_topk(num_reqs, head_hidden)
+             return
